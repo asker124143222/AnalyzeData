@@ -4,16 +4,16 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.HBaseConfiguration;
-import org.apache.hadoop.hbase.client.Mutation;
-import org.apache.hadoop.hbase.client.Put;
-import org.apache.hadoop.hbase.client.Result;
-import org.apache.hadoop.hbase.client.Scan;
+import org.apache.hadoop.hbase.TableName;
+import org.apache.hadoop.hbase.client.*;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
-import org.apache.hadoop.hbase.mapreduce.IdentityTableReducer;
 import org.apache.hadoop.hbase.mapreduce.TableMapReduceUtil;
 import org.apache.hadoop.hbase.mapreduce.TableMapper;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.KeyValue;
+import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.mapreduce.lib.output.NullOutputFormat;
 import org.apache.hadoop.util.GenericOptionsParser;
 import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
@@ -22,72 +22,92 @@ import org.json.simple.parser.JSONParser;
 
 import java.io.IOException;
 
-
 /**
  * @Author: xu.dm
- * @Date: 2019/4/27 13:50
- * @Description: 把输入的hbase表里json数据按键值导出到其他表
+ * @Date: 2019/5/1 20:33
+ * @Description: 把hbase数据表里的json分解，键值为link的存储到linktable，其他存储到infotable
  */
-public class ParseJson {
-    private static final String HDFSUri = "hdfs://bigdata-senior01.home.com:9000";
-    private static final Log LOG = LogFactory.getLog(ParseJson.class);
-    public static final String NAME = "ParseJson";
-    public enum Counters {ROWS,COLS,VALID,ERROR};
+public class ParseJsonMulti {
+    private static final Log LOG = LogFactory.getLog(ParseJsonMulti.class);
 
-    static class ParseMapper extends TableMapper<ImmutableBytesWritable, Mutation>{
+    public static final String NAME = "ParseJsonMulti";
+    public enum Counters {ROWS,COLS,VALID,ERROR}
+
+    static class ParseMapper extends TableMapper<ImmutableBytesWritable, Writable>{
+        private Connection connection =null;
+        private BufferedMutator infoTable = null;
+        private BufferedMutator linkTable = null;
         private JSONParser parser = new JSONParser();
         private byte[] columnFamily = null;
 
+
         @Override
         protected void setup(Context context) throws IOException, InterruptedException {
-            columnFamily = Bytes.toBytes(context.getConfiguration().get("conf.columnFamily"));
+            connection = ConnectionFactory.createConnection(context.getConfiguration());
+            infoTable = connection.getBufferedMutator(TableName.valueOf(context.getConfiguration().get("conf.infotable")));
+            linkTable = connection.getBufferedMutator(TableName.valueOf(context.getConfiguration().get("conf.linktable")));
+            columnFamily = Bytes.toBytes(context.getConfiguration().get("conf.columnfamily"));
         }
 
         @Override
         protected void map(ImmutableBytesWritable key, Result value, Context context) throws IOException, InterruptedException {
             context.getCounter(Counters.ROWS).increment(1);
-            String val = null;
+            String columnValue =null;
             try {
-                Put put = new Put(key.get());
+                Put infoPut = new Put(key.get());
+                Put linkPut = new Put(key.get());
                 for(Cell cell : value.listCells()){
                     context.getCounter(Counters.COLS).increment(1);
-                    val = Bytes.toStringBinary(cell.getValueArray(),cell.getValueOffset(),cell.getValueLength());
-                    JSONObject json = (JSONObject) parser.parse(val);
-
-                    for (Object jsonKey : json.keySet()){
+                    columnValue = Bytes.toString(cell.getValueArray(),cell.getValueOffset(),cell.getValueLength());
+                    JSONObject json = (JSONObject)parser.parse(columnValue);
+                    for(Object jsonKey : json.keySet()){
                         Object jsonValue = json.get(jsonKey);
-                        put.addColumn(columnFamily,Bytes.toBytes(jsonKey.toString()),Bytes.toBytes(jsonValue.toString()));
+                        if ("link".equals(jsonKey)){
+                            linkPut.addColumn(columnFamily,Bytes.toBytes(jsonKey.toString()),Bytes.toBytes(jsonValue.toString()));
+                        }else{
+                            infoPut.addColumn(columnFamily,Bytes.toBytes(jsonKey.toString()),Bytes.toBytes(jsonValue.toString()));
+                        }
                     }
                 }
-                context.write(key,put);
+                infoTable.mutate(infoPut);
+                linkTable.mutate(linkPut);
                 context.getCounter(Counters.VALID).increment(1);
             }catch (Exception e){
                 e.printStackTrace();
-                System.err.println("Error: " + e.getMessage() + ", Row: " +
-                        Bytes.toStringBinary(key.get()) + ", JSON: " + value);
+                System.err.println("ERROR: "+e.getMessage()+",Row: "+Bytes.toStringBinary(key.get())+", JSON: "+columnValue);
                 context.getCounter(Counters.ERROR).increment(1);
             }
         }
+
+        @Override
+        protected void cleanup(Context context) throws IOException, InterruptedException {
+            infoTable.flush();
+            linkTable.flush();
+        }
     }
 
-    private static CommandLine parseArgs(String[] args) throws ParseException{
+    private static CommandLine parseArgs(String[] args) throws ParseException {
         Options options = new Options();
         Option o = new Option("i", "input", true,
                 "table to read from (must exist)");
         o.setArgName("input-table-name");
         o.setRequired(true);
         options.addOption(o);
-        o = new Option("o", "output", true,
-                "table to write to (must exist)");
-        o.setArgName("output-table-name");
-        o.setRequired(true);
-        options.addOption(o);
         o = new Option("c", "column", true,
                 "column to read data from (must exist)");
         o.setArgName("family:qualifier");
         options.addOption(o);
+        o = new Option("o", "infotbl", true,
+                "info table to write to (must exist)");
+        o.setArgName("info-table-name");
+        o.setRequired(true);
+        options.addOption(o);
+        o = new Option("l", "linktbl", true,
+                "link table to write to (must exist)");
+        o.setArgName("link-table-name");
+        o.setRequired(true);
+        options.addOption(o);
         options.addOption("d", "debug", false, "switch on DEBUG log level");
-
         CommandLineParser parser = new PosixParser();
         CommandLine cmd = null;
         try {
@@ -108,38 +128,34 @@ public class ParseJson {
 
     public static void main(String[] args) throws Exception{
         Configuration conf = HBaseConfiguration.create();
-
-//        conf.set("hbase.master","192.168.31.10");
-//        conf.set("hbase.zookeeper.quorum", "192.168.31.10");
-//        conf.set("hbase.rootdir","hdfs://bigdata-senior01.home.com:9000/hbase");
-//        conf.set("hbase.zookeeper.property.dataDir","hdfs://bigdata-senior01.home.com:9000/hbase/zookeeper");
-
-        String[] runArgs = new GenericOptionsParser(conf,args).getRemainingArgs();
+        String[] runArgs = new GenericOptionsParser(args).getRemainingArgs();
         CommandLine cmd = parseArgs(runArgs);
+
         if(cmd.hasOption("d")) conf.set("conf.debug","true");
         String input = cmd.getOptionValue("i");
-        String output = cmd.getOptionValue("o");
         String column = cmd.getOptionValue("c");
+
+        conf.set("conf.infotable", cmd.getOptionValue("o"));
+        conf.set("conf.linktable", cmd.getOptionValue("l"));
 
         ColumnParser columnParser = new ColumnParser();
         columnParser.parse(column);
         if(!columnParser.isValid()) throw new IOException("family or qualifier error");
         byte[] family = columnParser.getFamily();
         byte[] qualifier = columnParser.getQualifier();
+        conf.set("conf.columnfamily", Bytes.toStringBinary(family));
+        conf.set("conf.columnqualifier",Bytes.toStringBinary(qualifier));
 
         Scan scan = new Scan();
         scan.addColumn(family,qualifier);
-        conf.set("conf.columnFamily", Bytes.toStringBinary(family));
 
-        Job job = Job.getInstance(conf, "Parse data in " + input +
-                ", write to " + output);
-        job.setJarByClass(ParseJson.class);
+        Job job = Job.getInstance(conf,ParseJsonMulti.NAME);
+        job.setJarByClass(ParseJsonMulti.class);
+
         TableMapReduceUtil.initTableMapperJob(input,scan,ParseMapper.class,ImmutableBytesWritable.class,Put.class,job);
-        TableMapReduceUtil.initTableReducerJob(output, IdentityTableReducer.class,job);
-        job.setNumReduceTasks(0); //实际上并不需要reduce过程，可以把reduce设置为0。
+        job.setOutputFormatClass(NullOutputFormat.class);
+        job.setNumReduceTasks(0);
 
         System.exit(job.waitForCompletion(true)?0:1);
-
     }
-
 }
